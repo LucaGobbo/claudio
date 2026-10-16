@@ -58,32 +58,66 @@ def main() -> None:
     if project_env:
         _, base_env = highest_claude_env()
         merged = {**base_env, **project_env}
-        merged = _resolve_op_references(merged)
+        merged = _resolve_secret_references(merged)
         extra_settings_args = ["--settings", json.dumps({"env": merged})]
 
     print(f"Using project: {selected['name']}")
     _exec_claude(extra_settings_args + claude_args)
 
 
-def _resolve_op_references(env: dict[str, str]) -> dict[str, str]:
+def _resolve_secret_references(env: dict[str, str]) -> dict[str, str]:
     resolved = {}
     for key, value in env.items():
         if value.startswith("op://"):
-            result = subprocess.run(
-                ["op", "read", value],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                print(
-                    f"claudio: failed to read 1Password secret for {key}: {result.stderr.strip()}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-            resolved[key] = result.stdout.strip()
+            resolved[key] = _read_op_secret(key, value)
+        elif value.startswith("keychain://"):
+            resolved[key] = _read_keychain_secret(key, value)
         else:
             resolved[key] = value
     return resolved
+
+
+def _read_op_secret(key: str, value: str) -> str:
+    result = subprocess.run(
+        ["op", "read", value],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(
+            f"claudio: failed to read 1Password secret for {key}: {result.stderr.strip()}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return result.stdout.strip()
+
+
+def _read_keychain_secret(key: str, value: str) -> str:
+    if sys.platform != "darwin":
+        print(
+            f"claudio: keychain:// references are only supported on macOS (env var {key})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    service, _, account = value[len("keychain://") :].partition("/")
+    if not service or not account:
+        print(
+            f"claudio: invalid keychain reference for {key}: expected keychain://<service>/<account>",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    result = subprocess.run(
+        ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(
+            f"claudio: failed to read Keychain secret for {key}: {result.stderr.strip()}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return result.stdout.strip()
 
 
 def _exec_claude(claude_args: list[str]) -> None:

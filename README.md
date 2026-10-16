@@ -79,7 +79,7 @@ Create a `claudio.settings.json` (shared) or `claudio.settings.local.json` (git-
 
 - **`projects`** — array of project objects:
   - **`name`** (string, required) — display name for the project.
-  - **`env`** (object, optional) — key-value pairs of environment variables. These are **merged** into the `env` of the Claude Code config, overriding only the keys you specify. Values starting with `op://` are resolved via the 1Password CLI at runtime (see below).
+  - **`env`** (object, optional) — key-value pairs of environment variables. These are **merged** into the `env` of the Claude Code config, overriding only the keys you specify. Values starting with `op://` are resolved via the 1Password CLI, and values starting with `keychain://` via the macOS Keychain, at runtime (see below).
 
 Example config:
 
@@ -156,5 +156,25 @@ Example3: the default for a "API Credential" type item
 When `claudio` detects an `op://` value, it resolves it via the [1Password CLI](https://www.1password.dev/cli/get-started) (`op read`) before passing the token to Claude Code. Everyone at iO has access to 1Password, so this is the preferred setup.
 
 You do need to setup 1Password CLI for this, see: https://www.1password.dev/cli/get-started
+
+### Storing API keys in the macOS Keychain
+
+On macOS you can also keep keys in the system Keychain, using the `keychain://<service>/<account>` scheme:
+
+```json
+"ANTHROPIC_AUTH_TOKEN": "keychain://claudio/customer-1"
+```
+
+Store the key with the `security` CLI. Omitting the value after `-w` makes `security` prompt for it, which keeps the key out of your shell history:
+
+```bash
+security add-generic-password -s claudio -a customer-1 -w
+```
+
+When `claudio` detects a `keychain://` value, it resolves it by running `security find-generic-password -s <service> -a <account> -w` before passing the token to Claude Code.
+
+- macOS only — on other operating systems `claudio` exits with an error.
+- Secrets are per machine: there is no shared vault or rotation like with 1Password.
+- Items created with `security add-generic-password` should not prompt on read, but macOS may show a prompt if the keychain is locked or the item was created by another app (e.g. the Keychain Access GUI).
 
 
