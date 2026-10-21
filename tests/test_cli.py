@@ -1,65 +1,518 @@
-import unittest
-from types import SimpleNamespace
-from unittest import mock
+"""Tests for claudio.cli — launch behavior, arg forwarding, and secret resolution."""
 
-from claudio.cli import _resolve_secret_references
+from __future__ import annotations
 
+import os
+import sys
+from unittest.mock import MagicMock, patch
 
-def _proc(returncode=0, stdout="", stderr=""):
-    return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+import pytest
 
-
-class ResolveSecretReferencesTest(unittest.TestCase):
-    def test_op_passthrough(self):
-        with mock.patch("claudio.cli.subprocess.run", return_value=_proc(stdout="s3cret\n")) as run:
-            out = _resolve_secret_references({"K": "op://vault/item/field"})
-        self.assertEqual(out, {"K": "s3cret"})
-        self.assertEqual(run.call_args.args[0], ["op", "read", "op://vault/item/field"])
-
-    def test_plain_value_untouched(self):
-        with mock.patch("claudio.cli.subprocess.run") as run:
-            out = _resolve_secret_references({"K": "plain"})
-        self.assertEqual(out, {"K": "plain"})
-        run.assert_not_called()
-
-    def test_keychain_success(self):
-        with mock.patch("claudio.cli.sys.platform", "darwin"), mock.patch(
-            "claudio.cli.subprocess.run", return_value=_proc(stdout="tok\n")
-        ) as run:
-            out = _resolve_secret_references({"K": "keychain://svc/acct"})
-        self.assertEqual(out, {"K": "tok"})
-        self.assertEqual(
-            run.call_args.args[0],
-            ["security", "find-generic-password", "-s", "svc", "-a", "acct", "-w"],
-        )
-
-    def test_malformed_refs_exit(self):
-        for ref in ("keychain://", "keychain://svc", "keychain://svc/"):
-            with self.subTest(ref=ref), mock.patch("claudio.cli.sys.platform", "darwin"), mock.patch(
-                "claudio.cli.subprocess.run"
-            ) as run:
-                with self.assertRaises(SystemExit) as cm:
-                    _resolve_secret_references({"K": ref})
-                self.assertEqual(cm.exception.code, 1)
-                run.assert_not_called()
-
-    def test_non_darwin_exit(self):
-        with mock.patch("claudio.cli.sys.platform", "linux"), mock.patch(
-            "claudio.cli.subprocess.run"
-        ) as run:
-            with self.assertRaises(SystemExit) as cm:
-                _resolve_secret_references({"K": "keychain://svc/acct"})
-        self.assertEqual(cm.exception.code, 1)
-        run.assert_not_called()
-
-    def test_security_failure_exit(self):
-        with mock.patch("claudio.cli.sys.platform", "darwin"), mock.patch(
-            "claudio.cli.subprocess.run", return_value=_proc(returncode=44, stderr="not found\n")
-        ):
-            with self.assertRaises(SystemExit) as cm:
-                _resolve_secret_references({"K": "keychain://svc/acct"})
-        self.assertEqual(cm.exception.code, 1)
+from claudio.cli import main
+from claudio.config import ConfigError
+from claudio.secrets import resolve_op_references
+from claudio.selector import AmbiguousProject, ProjectNotFound
 
 
-if __name__ == "__main__":
-    unittest.main()
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_project(name="work", env=None):
+    p = {"name": name}
+    if env is not None:
+        p["env"] = env
+    return p
+
+
+# ---------------------------------------------------------------------------
+# resolve_op_references
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_op_references_passes_through_plain_values():
+    result = resolve_op_references({"KEY": "plain-value"})
+    assert result == {"KEY": "plain-value"}
+
+
+def test_resolve_op_references_calls_op_read_for_op_ref():
+    fake = MagicMock()
+    fake.returncode = 0
+    fake.stdout = "resolved-secret"
+    with patch("claudio.secrets.shutil.which", return_value="op"), \
+         patch("claudio.secrets.subprocess.run", return_value=fake) as mock_run:
+        result = resolve_op_references({"KEY": "op://vault/item/field"})
+    mock_run.assert_called_once()
+    assert mock_run.call_args[0][0] == ["op", "read", "--no-newline", "op://vault/item/field"]
+    assert result["KEY"] == "resolved-secret"
+
+
+def test_resolve_op_references_exits_on_op_failure():
+    fake = MagicMock()
+    fake.returncode = 1
+    fake.stderr = "item not found"
+    with patch("claudio.secrets.shutil.which", return_value="op"), \
+         patch("claudio.secrets.subprocess.run", return_value=fake):
+        with pytest.raises(SystemExit) as exc_info:
+            resolve_op_references({"KEY": "op://vault/item/field"})
+    assert exc_info.value.code == 1
+
+
+def test_resolve_op_references_mixed_values():
+    fake = MagicMock()
+    fake.returncode = 0
+    fake.stdout = "secret"
+    with patch("claudio.secrets.shutil.which", return_value="op"), \
+         patch("claudio.secrets.subprocess.run", return_value=fake):
+        result = resolve_op_references({
+            "PLAIN": "plain-value",
+            "SECRET": "op://vault/item/field",
+        })
+    assert result["PLAIN"] == "plain-value"
+    assert result["SECRET"] == "secret"
+
+
+# ---------------------------------------------------------------------------
+# main — no config → pass-through to claude
+# ---------------------------------------------------------------------------
+
+
+def test_main_no_config_launches_claude_directly(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["claudio"])
+    with patch("claudio.cli.merged_claudio_config", return_value={}), \
+         patch("claudio.cli.exec_claude") as mock_exec:
+        main()
+    mock_exec.assert_called_once_with([])
+
+
+def test_main_no_config_forwards_extra_args(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["claudio", "--model", "sonnet", "--no-stream"])
+    with patch("claudio.cli.merged_claudio_config", return_value={}), \
+         patch("claudio.cli.exec_claude") as mock_exec:
+        main()
+    mock_exec.assert_called_once_with(["--model", "sonnet", "--no-stream"])
+
+
+# ---------------------------------------------------------------------------
+# main — invalid config → hard fail
+# ---------------------------------------------------------------------------
+
+
+def test_main_invalid_project_schema_exits(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["claudio"])
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": []}), \
+         patch("claudio.cli.validate_projects", side_effect=ConfigError("bad schema")):
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+    assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# main — single project → auto-selected, no prompt
+# ---------------------------------------------------------------------------
+
+
+def test_main_single_project_auto_selected(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["claudio"])
+    project = _make_project("work", env={"ANTHROPIC_API_KEY": "sk-test"})
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": [project]}), \
+         patch("claudio.cli.validate_projects", return_value=[project]), \
+         patch("claudio.cli.highest_claude_env", return_value=(None, {})), \
+         patch("claudio.cli.resolve_op_references", return_value={"ANTHROPIC_API_KEY": "sk-test"}), \
+         patch("claudio.cli.resolve_project", return_value=project) as mock_resolve, \
+         patch("claudio.cli.exec_claude"):
+        main()
+    mock_resolve.assert_called_once_with([project], hint=None, interactive=True)
+
+
+# ---------------------------------------------------------------------------
+# main — multiple projects → select_project called
+# ---------------------------------------------------------------------------
+
+
+def test_main_multiple_projects_calls_resolve_project(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["claudio"])
+    projects = [_make_project("work"), _make_project("personal")]
+    selected = projects[0]
+
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": projects}), \
+         patch("claudio.cli.validate_projects", return_value=projects), \
+         patch("claudio.cli.resolve_project", return_value=selected) as mock_resolve, \
+         patch("claudio.cli.exec_claude"):
+        main()
+    mock_resolve.assert_called_once_with(projects, hint=None, interactive=True)
+
+
+def test_main_select_project_cancel_exits_130(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["claudio"])
+    projects = [_make_project("work"), _make_project("personal")]
+
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": projects}), \
+         patch("claudio.cli.validate_projects", return_value=projects), \
+         patch("claudio.cli.resolve_project", return_value=None), \
+         patch("claudio.cli.exec_claude"):
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+    assert exc_info.value.code == 130
+
+
+# ---------------------------------------------------------------------------
+# main — env forwarding and op:// resolution
+# ---------------------------------------------------------------------------
+
+
+def test_main_op_reference_resolved_and_set_in_env(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["claudio"])
+    project = _make_project("work", env={"ANTHROPIC_API_KEY": "op://vault/item/field"})
+
+    def fake_resolve(env):
+        return {k: "resolved-secret" if v.startswith("op://") else v for k, v in env.items()}
+
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": [project]}), \
+         patch("claudio.cli.validate_projects", return_value=[project]), \
+         patch("claudio.cli.highest_claude_env", return_value=(None, {})), \
+         patch("claudio.cli.resolve_op_references", side_effect=fake_resolve) as mock_resolve, \
+         patch("claudio.cli.exec_claude"):
+        main()
+
+    mock_resolve.assert_called_once()
+    assert os.environ.get("ANTHROPIC_API_KEY") == "resolved-secret"
+
+
+def test_main_extra_args_forwarded_to_claude(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["claudio", "--verbose"])
+    project = _make_project("work", env={"ANTHROPIC_API_KEY": "sk-test"})
+
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": [project]}), \
+         patch("claudio.cli.validate_projects", return_value=[project]), \
+         patch("claudio.cli.highest_claude_env", return_value=(None, {})), \
+         patch("claudio.cli.resolve_op_references", return_value={"ANTHROPIC_API_KEY": "sk-test"}), \
+         patch("claudio.cli.exec_claude") as mock_exec:
+        main()
+
+    exec_args = mock_exec.call_args[0][0]
+    assert "--verbose" in exec_args
+
+
+def test_main_no_env_in_project_launches_claude_with_original_args_only(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["claudio"])
+    project = _make_project("work")  # no env
+
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": [project]}), \
+         patch("claudio.cli.validate_projects", return_value=[project]), \
+         patch("claudio.cli.exec_claude") as mock_exec:
+        main()
+
+    exec_args = mock_exec.call_args[0][0]
+    assert exec_args == []
+
+
+# ---------------------------------------------------------------------------
+# main — --project flag
+# ---------------------------------------------------------------------------
+
+
+def test_main_project_flag_selects_by_name(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["claudio", "--project", "personal"])
+    projects = [_make_project("work"), _make_project("personal")]
+
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": projects}), \
+         patch("claudio.cli.validate_projects", return_value=projects), \
+         patch("claudio.cli.resolve_project", return_value=projects[1]) as mock_resolve, \
+         patch("claudio.cli.exec_claude"):
+        main()
+
+    mock_resolve.assert_called_once_with(projects, hint="personal", interactive=True)
+
+
+def test_main_project_flag_unknown_name_exits(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["claudio", "--project", "unknown"])
+    projects = [_make_project("work"), _make_project("personal")]
+
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": projects}), \
+         patch("claudio.cli.validate_projects", return_value=projects), \
+         patch("claudio.cli.resolve_project",
+               side_effect=ProjectNotFound("unknown", projects)):
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+    assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# main — CLAUDIO_PROJECT env var
+# ---------------------------------------------------------------------------
+
+
+def test_main_env_var_selects_by_name(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["claudio"])
+    monkeypatch.setenv("CLAUDIO_PROJECT", "personal")
+    projects = [_make_project("work"), _make_project("personal")]
+
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": projects}), \
+         patch("claudio.cli.validate_projects", return_value=projects), \
+         patch("claudio.cli.resolve_project", return_value=projects[1]) as mock_resolve, \
+         patch("claudio.cli.exec_claude"):
+        main()
+
+    mock_resolve.assert_called_once_with(projects, hint="personal", interactive=True)
+
+
+def test_main_project_flag_beats_env_var(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["claudio", "--project", "work"])
+    monkeypatch.setenv("CLAUDIO_PROJECT", "personal")
+    projects = [_make_project("work"), _make_project("personal")]
+
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": projects}), \
+         patch("claudio.cli.validate_projects", return_value=projects), \
+         patch("claudio.cli.resolve_project", return_value=projects[0]) as mock_resolve, \
+         patch("claudio.cli.exec_claude"):
+        main()
+
+    mock_resolve.assert_called_once_with(projects, hint="work", interactive=True)
+
+
+# ---------------------------------------------------------------------------
+# main — --no-interactive
+# ---------------------------------------------------------------------------
+
+
+def test_main_no_interactive_passes_flag_to_resolve(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["claudio", "--no-interactive"])
+    projects = [_make_project("work"), _make_project("personal")]
+
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": projects}), \
+         patch("claudio.cli.validate_projects", return_value=projects), \
+         patch("claudio.cli.resolve_project",
+               side_effect=AmbiguousProject(projects)):
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+    assert exc_info.value.code == 1
+
+
+def test_main_no_interactive_single_project_succeeds(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["claudio", "--no-interactive"])
+    project = _make_project("work")
+
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": [project]}), \
+         patch("claudio.cli.validate_projects", return_value=[project]), \
+         patch("claudio.cli.resolve_project", return_value=project) as mock_resolve, \
+         patch("claudio.cli.exec_claude"):
+        main()
+
+    mock_resolve.assert_called_once_with([project], hint=None, interactive=False)
+
+
+# ---------------------------------------------------------------------------
+# resolve_project — unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_project_hint_matches_by_name():
+    from claudio.selector import resolve_project
+    projects = [_make_project("work"), _make_project("personal")]
+    result = resolve_project(projects, hint="personal")
+    assert result["name"] == "personal"
+
+
+def test_resolve_project_hint_not_found_raises():
+    from claudio.selector import resolve_project
+    projects = [_make_project("work")]
+    with pytest.raises(ProjectNotFound) as exc_info:
+        resolve_project(projects, hint="missing")
+    assert exc_info.value.name == "missing"
+    assert exc_info.value.available == projects
+
+
+def test_resolve_project_single_auto_selects():
+    from claudio.selector import resolve_project
+    project = _make_project("work")
+    result = resolve_project([project])
+    assert result["name"] == "work"
+
+
+def test_resolve_project_multiple_non_interactive_raises():
+    from claudio.selector import resolve_project
+    projects = [_make_project("work"), _make_project("personal")]
+    with pytest.raises(AmbiguousProject) as exc_info:
+        resolve_project(projects, interactive=False)
+    assert len(exc_info.value.projects) == 2
+
+
+# ---------------------------------------------------------------------------
+# claudio projects subcommand
+# ---------------------------------------------------------------------------
+
+
+def test_main_projects_subcommand_lists_all(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["claudio", "projects"])
+    projects = [_make_project("work"), _make_project("personal")]
+
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": projects}), \
+         patch("claudio.cli.validate_projects", return_value=projects), \
+         patch("claudio.cli.load_user_settings", return_value={}):
+        main()
+
+    out = capsys.readouterr().out
+    assert "work" in out
+    assert "personal" in out
+
+
+def test_main_projects_subcommand_marks_last(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["claudio", "projects"])
+    projects = [_make_project("work"), _make_project("personal")]
+
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": projects}), \
+         patch("claudio.cli.validate_projects", return_value=projects), \
+         patch("claudio.cli.load_user_settings", return_value={"lastProject": "personal"}):
+        main()
+
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    personal_line = next(l for l in lines if "personal" in l)
+    assert "*" in personal_line
+
+
+# ---------------------------------------------------------------------------
+# claudio current subcommand
+# ---------------------------------------------------------------------------
+
+
+def test_main_current_subcommand_prints_name(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["claudio", "current"])
+    project = _make_project("work")
+
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": [project]}), \
+         patch("claudio.cli.validate_projects", return_value=[project]), \
+         patch("claudio.cli.resolve_project", return_value=project):
+        main()
+
+    assert capsys.readouterr().out.strip() == "work"
+
+
+def test_main_current_subcommand_no_config_exits(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["claudio", "current"])
+
+    with patch("claudio.cli.merged_claudio_config", return_value={}):
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+    assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# claudio doctor subcommand
+# ---------------------------------------------------------------------------
+
+
+def _make_project_env(name, env):
+    return {"name": name, "env": env}
+
+
+def test_main_doctor_no_config_exits(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["claudio", "doctor"])
+    with patch("claudio.cli.merged_claudio_config", return_value={}):
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+    assert exc_info.value.code == 1
+
+
+def test_main_doctor_healthy_bearer_exits_0(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["claudio", "doctor"])
+    project = _make_project_env("Klant A", {
+        "ANTHROPIC_BASE_URL": "https://proxy.company.com",
+        "ANTHROPIC_AUTH_TOKEN": "op://Employee/KlantA/token",
+    })
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": [project]}), \
+         patch("claudio.cli.validate_projects", return_value=[project]):
+        main()
+    out = capsys.readouterr().out
+    assert "warning" not in out
+    assert "No issues found" in out
+
+
+def test_main_doctor_healthy_api_key_exits_0(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["claudio", "doctor"])
+    project = _make_project_env("Personal", {"ANTHROPIC_API_KEY": "op://Personal/Anthropic/credential"})
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": [project]}), \
+         patch("claudio.cli.validate_projects", return_value=[project]):
+        main()
+    out = capsys.readouterr().out
+    assert "warning" not in out
+
+
+def test_main_doctor_no_credential_warns_exits_1(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["claudio", "doctor"])
+    project = {"name": "Empty"}
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": [project]}), \
+         patch("claudio.cli.validate_projects", return_value=[project]):
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+    assert exc_info.value.code == 1
+    assert "warning" in capsys.readouterr().out
+
+
+def test_main_doctor_both_credentials_warns_exits_1(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["claudio", "doctor"])
+    project = _make_project_env("Conflict", {
+        "ANTHROPIC_API_KEY": "sk-test",
+        "ANTHROPIC_AUTH_TOKEN": "token",
+    })
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": [project]}), \
+         patch("claudio.cli.validate_projects", return_value=[project]):
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+    assert exc_info.value.code == 1
+    out = capsys.readouterr().out
+    assert "warning" in out
+    assert "ANTHROPIC_AUTH_TOKEN" in out
+    assert "ANTHROPIC_API_KEY" in out
+
+
+def test_main_doctor_op_ref_shown_as_1password(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["claudio", "doctor"])
+    project = _make_project_env("Work", {
+        "ANTHROPIC_BASE_URL": "https://proxy.company.com",
+        "ANTHROPIC_AUTH_TOKEN": "op://vault/item/field",
+    })
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": [project]}), \
+         patch("claudio.cli.validate_projects", return_value=[project]):
+        main()
+    assert "1Password" in capsys.readouterr().out
+
+
+def test_main_doctor_auth_token_without_base_url_shows_note_exits_0(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["claudio", "doctor"])
+    project = _make_project_env("Work", {"ANTHROPIC_AUTH_TOKEN": "op://vault/item/field"})
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": [project]}), \
+         patch("claudio.cli.validate_projects", return_value=[project]):
+        main()
+    out = capsys.readouterr().out
+    assert "note" in out
+    assert "warning" not in out
+
+
+def test_main_doctor_plaintext_shown_as_plaintext(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["claudio", "doctor"])
+    project = _make_project_env("Work", {
+        "ANTHROPIC_BASE_URL": "https://proxy.company.com",
+        "ANTHROPIC_AUTH_TOKEN": "my-token",
+    })
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": [project]}), \
+         patch("claudio.cli.validate_projects", return_value=[project]):
+        main()
+    assert "plaintext" in capsys.readouterr().out
+
+
+def test_main_current_subcommand_ambiguous_falls_back_to_last(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["claudio", "current"])
+    projects = [_make_project("work"), _make_project("personal")]
+
+    with patch("claudio.cli.merged_claudio_config", return_value={"projects": projects}), \
+         patch("claudio.cli.validate_projects", return_value=projects), \
+         patch("claudio.cli.resolve_project",
+               side_effect=AmbiguousProject(projects)), \
+         patch("claudio.cli.load_user_settings", return_value={"lastProject": "work"}):
+        main()
+
+    assert capsys.readouterr().out.strip() == "work"
+

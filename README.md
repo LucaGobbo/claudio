@@ -1,71 +1,88 @@
-# claudio
+# Claudio
 
-CLI wrapper for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) that lets you switch between projects with different API keys (or other env vars) before launching `claude` and retrieving them from 1Password, before launching claude.
+Manages named API keys for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and launches `claude` with the right one. Secrets are pulled from 1Password at runtime — nothing stored in plaintext.
 
-## The Problem
+## Claude Code
 
-When working for multiple clients, you often need to switch between different Anthropic API keys. Claude Code doesn't provide a way to select a named project configuration at launch — you'd have to manually update your config or environment before each session.
-
-On top of that, storing API keys as plaintext in config files is a supply chain risk.
-
-## This Solution
-
-`claudio` lets you define named project profiles, each with their own env vars. At launch you pick a project and its env is merged into your Claude config for that session. API keys are stored securely in 1Password and resolved at runtime — never written to disk in plaintext.
-
-> Claude Code also supports [`apiKeyHelper`](https://code.claude.com/docs/en/settings#available-settings) — a shell command that returns an API key at runtime, so you can pull it from 1Password yourself:
-> ```json
-> { "apiKeyHelper": "op read op://Personal/Anthropic/credential" }
-> ```
-> This works well for a single key per machine, but it can't be combined with an auth token. claudio adds value when you manage multiple clients with different keys or need per-project env vars beyond just the API key.
-
-## Prerequisites
-
-- Mac/Linux: [homebrew](https://brew.sh/) package manager (run once ever):
-  ```sh
-  brew tap iodigital-com/io
-  ```
-  ```sh
-  brew trust --tap iodigital-com/io
-  ```
-
-  (or) [uv](https://docs.astral.sh/uv/) package manager
-- Windows: [uv](https://docs.astral.sh/uv/) package manager
-
-## Installation
-### Mac/Linux
-1. brew install claudio
-1. Run `claudio` anywhere
-
-### Windows
-1. Clone the repo
-1. Run `uv tool install . --reinstall` from the repo root
-1. Run `claudio` anywhere
-
-## Usage
-
+**Install** (Mac/Linux):
 ```sh
-# Launch with project selection
-claudio
-
-# Pass arguments through to claude
-claudio --model claude-4-5-sonnet -p "hello"
-
-# Help
-claudio --help
+brew tap iodigital-com/io
+brew trust --tap iodigital-com/io
+brew install claudio
 ```
 
-When you run `claudio`:
+Windows: clone the repo and run `uv tool install . --reinstall` from the repo root.
 
-1. It discovers your `claudio` config (highest precedence wins).
-1. If there's only **one** project, it's selected automatically.
-1. Otherwise you're prompted to pick one (the last-used project is the default).
-1. The selected project's env is retrieved from 1Password and merged into your Claude config.
-1. `claude` is launched with any extra CLI arguments you passed.
+**Create a config** at `~/.claude/claudio.settings.json`:
 
-If no `claudio` config exists, `claude` is launched directly.
-Note that even though `claudio` works with API keys specified in the settings files for backward compatibility, the 1Password store is highly preferred.
+```json
+{
+  "projects": [
+    {
+      "name": "Klant A",
+      "env": {
+        "ANTHROPIC_BASE_URL": "https://proxy.klantA.com",
+        "ANTHROPIC_AUTH_TOKEN": "op://Employee/klantA/password" //format= op://<vaultName>/<secretName>/<attributeName>
+      }
+    }
+  ]
+}
+```
 
-## Configuration
+**Run:**
+```sh
+claudio [-normal claude parameters]
+```
+
+You get an interactive picker with the last-used profile as default, claudio resolves `op://` secrets from 1Password, and launches `claude`. With only one profile it selects automatically.
+
+Run `claudio doctor` to verify your setup.
+
+> For multiple profiles, per-repo pinning, and advanced config see [Configuration reference](#configuration-reference).
+
+### Common warnings
+
+| Warning | Fix |
+| --- | --- |
+| `no credential configured` | Add `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` to the credentials profile env |
+| `both ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN are set` | Remove one; `ANTHROPIC_AUTH_TOKEN` takes precedence |
+| `op not found` | Install the 1Password CLI from https://developer.1password.com/docs/cli/get-started/ |
+| `claude not found` | Install Claude Code |
+| `ANTHROPIC_AUTH_TOKEN set without ANTHROPIC_BASE_URL` | Usually means you forgot `ANTHROPIC_BASE_URL`; fine if your proxy is set globally |
+
+## For Claude Code in Visual Studio Code 
+
+> **claudio does not replace the Claude Code extension.** It only injects the right `ANTHROPIC_*` credentials into the environment before Claude Code starts. Install the Claude Code extension in VS Code first (Extensions view → search "Claude Code" → Install).
+
+With claudio installed and a config in place (see above), run **once per machine**:
+
+```sh
+claudio setup vscode --workspace
+```
+
+Restart VS Code (or run *Developer: Reload Window*). From now on, VS Code launches the Claude Code extension through claudio automatically — credentials are resolved without any prompts. The setup also sets `claudeCode.disableLoginPrompt`, so the extension doesn't ask for an interactive sign-in when claudio already injects credentials.
+
+Still seeing *Not logged in* / *Please run /login*? See [Troubleshooting the VS Code / Cursor wrapper](#troubleshooting-the-vs-code--cursor-wrapper).
+
+If you have multiple credentials profiles, pin the right one for a repo by creating `.claude/claudio.settings.local.json` with a single profile (see [Pinning a credentials profile per repo](#pinning-a-credentials-profile-per-repo)).
+
+> Preview what the setup command writes without applying it: `claudio setup vscode --print`
+
+## For Claude Code in Cursor
+
+With claudio installed and a config in place, run **once per machine**:
+
+```sh
+claudio setup cursor --workspace
+```
+
+Restart Cursor. Works identically to the VS Code setup (install the Claude Code extension in Cursor first) — the same `~/.claude/claudio-wrapper` shim is reused, so running both `setup vscode` and `setup cursor` is safe.
+
+> Preview: `claudio setup cursor --print`
+
+---
+
+## Configuration reference
 
 Create a `claudio.settings.json` (shared) or `claudio.settings.local.json` (git-ignored, personal) in any of these locations (same hierarchy as Claude Code):
 
@@ -75,87 +92,139 @@ Create a `claudio.settings.json` (shared) or `claudio.settings.local.json` (git-
 | Project       | `.claude/claudio.settings.json`       |
 | Project local | `.claude/claudio.settings.local.json` |
 
-### Config Schema
+### Schema
 
-- **`projects`** — array of project objects:
-  - **`name`** (string, required) — display name for the project.
-  - **`env`** (object, optional) — key-value pairs of environment variables. These are **merged** into the `env` of the Claude Code config, overriding only the keys you specify. Values starting with `op://` are resolved via the 1Password CLI, and values starting with `keychain://` via the macOS Keychain, at runtime (see below).
+- **`projects`** — array of credentials profile objects:
+  - **`name`** (string, required) — display name for the credentials profile.
+  - **`env`** (object, optional) — key-value pairs merged into the Claude Code `env`. Values starting with `op://` are resolved via the 1Password CLI, and values starting with `keychain://` via the macOS Keychain, at runtime (see below).
 
-Example config:
+### Supported env vars
+
+| Variable | Purpose |
+| --- | --- |
+| `ANTHROPIC_AUTH_TOKEN` | Bearer token — for company proxies or OAuth tokens |
+| `ANTHROPIC_API_KEY` | API key — for direct Anthropic access or proxies that require one |
+| `ANTHROPIC_BASE_URL` | Endpoint URL — required when routing through a company proxy |
+
+Set `ANTHROPIC_AUTH_TOKEN` **or** `ANTHROPIC_API_KEY`, not both. If both are present, `ANTHROPIC_AUTH_TOKEN` takes precedence in Claude Code. Use `claudio doctor` to catch conflicts.
+
+### Examples
+
+
+
+**Company proxy (bearer token):**
 
 ```json
 {
   "projects": [
     {
-      "name": "Customer 1",
+      "name": "Klant A",
       "env": {
-        "ANTHROPIC_AUTH_TOKEN": "1Password reference - op://....."
+        "ANTHROPIC_BASE_URL": "https://proxy.company.com",
+        "ANTHROPIC_AUTH_TOKEN": "op://Employee/Klant A/token"
+      }
+    }
+  ]
+}
+```
+**Direct Anthropic API:**
+
+```json
+{
+  "projects": [
+    {
+      "name": "Personal",
+      "env": {
+        "ANTHROPIC_API_KEY": "op://Personal/Anthropic/credential"
+      }
+    }
+  ]
+}
+```
+**Multiple clients, mixed setup:**
+
+```json
+{
+  "projects": [
+    {
+      "name": "Klant A",
+      "env": {
+        "ANTHROPIC_BASE_URL": "https://proxy.klantA.com",
+        "ANTHROPIC_AUTH_TOKEN": "op://Employee/Klant A/token"
       }
     },
     {
-      "name": "Customer 2",
+      "name": "Klant B",
       "env": {
-        "ANTHROPIC_AUTH_TOKEN": "sk-..."
+        "ANTHROPIC_BASE_URL": "https://proxy.klantA.com",
+        "ANTHROPIC_AUTH_TOKEN": "op://Employee/Klant A/token"
       }
     }
   ]
 }
 ```
 
-### Pinning a project per repo
+### Pinning a credentials profile per repo
 
-If you always use the same project in a given repo, create a `.claude/claudio.settings.local.json` in your workspace with a single project:
+If you always use the same credentials profile in a given repo, create a `.claude/claudio.settings.local.json` in your workspace with a single profile:
 
 ```json
 {
   "projects": [
     {
-      "name": "Customer 1",
+      "name": "Klant A",
       "env": {
-        "ANTHROPIC_AUTH_TOKEN": "op://....."
+        "ANTHROPIC_BASE_URL": "https://proxy.klantA.com",
+        "ANTHROPIC_AUTH_TOKEN": "op://Employee/Klant A/token"
       }
     }
   ]
 }
 ```
 
-Because there's only one project, `claudio` will select it automatically — no prompt needed.
+Because there's only one credentials profile, `claudio` selects it automatically — no prompt needed. This is also the recommended way to resolve credentials in VS Code and Cursor wrapper mode.
 
-### Storing API keys securely with 1Password
+### Other commands
 
-Storing API keys as plaintext in config files is a supply chain risk — if a malicious package or tool reads your filesystem, your keys are exposed. The recommended approach is to store API keys in 1Password and reference them using the `op://` URI scheme:
+```sh
+# Select credentials profile by name (non-interactive)
+claudio --project "Klant A"
 
-```json
-{
-  "projects": [
-    {
-      "name": "Customer 1",
-      "env": {
-        "ANTHROPIC_AUTH_TOKEN": "op://<vault>/<item>/<attribute>"
-      }
-    }
-  ]
-}
+# Pass arguments through to claude
+claudio --model claude-sonnet-4-5
+
+# List configured credentials profiles
+claudio projects
+
+# Print the currently selected credentials profile name
+claudio current
 ```
 
-> You can use different 1Password item types if you want and create your own (password-typed) attributes if you want.
+If no `claudio` config exists, `claude` is launched directly.
 
-Example1: the default for a "password" type item
+## Storing API keys securely with 1Password
+
+Storing API keys as plaintext in config files is a supply chain risk — if a malicious package or tool reads your filesystem, your keys are exposed. Store secrets in 1Password and reference them with the `op://` URI scheme:
+
+```
+op://<vault>/<item>/<attribute>
+```
+
+**Common patterns:**
+
 ```json
 "ANTHROPIC_AUTH_TOKEN": "op://Employee/Bonzai API key clientX/password"
 ```
-Example2: the "password" type with a custom password-type attribute
 ```json
 "ANTHROPIC_AUTH_TOKEN": "op://Employee/Bonzai API keys/clientX"
 ```
-Example3: the default for a "API Credential" type item
 ```json
 "ANTHROPIC_AUTH_TOKEN": "op://Employee/Bonzai API key ClientX/referentie"
 ```
 
-When `claudio` detects an `op://` value, it resolves it via the [1Password CLI](https://www.1password.dev/cli/get-started) (`op read`) before passing the token to Claude Code. Everyone at iO has access to 1Password, so this is the preferred setup.
+> You can use any 1Password item type and create custom (password-typed) attributes.
 
-You do need to setup 1Password CLI for this, see: https://www.1password.dev/cli/get-started
+When `claudio` detects an `op://` value, it resolves it via the [1Password CLI](https://www.1password.dev/cli/get-started) (`op read --no-newline`) before passing the token to Claude Code. Identical `op://` refs within one run are cached so you get at most one biometric prompt per unique secret.
 
 ### Storing API keys in the macOS Keychain
 
@@ -177,4 +246,77 @@ When `claudio` detects a `keychain://` value, it resolves it by running `securit
 - Secrets are per machine: there is no shared vault or rotation like with 1Password.
 - Items created with `security add-generic-password` should not prompt on read, but macOS may show a prompt if the keychain is locked or the item was created by another app (e.g. the Keychain Access GUI).
 
+You need the 1Password CLI installed: https://www.1password.dev/cli/get-started
+
+### Security trade-offs
+
+| Approach | Where secrets live | Risk |
+| --- | --- | --- |
+| `op://` in config | 1Password vault, resolved at runtime | Low — requires 1Password CLI and biometric |
+| Plaintext in config | Config file on disk | Medium — readable by any process with filesystem access |
+| Environment variable injection | Process environment, inherited by child | Low — not visible in `ps` output |
+
+## How wrapper mode for VS and Cursor works
+
+When you run `claudio setup vscode --workspace` or `claudio setup cursor --workspace`, claudio:
+
+1. Creates `~/.claude/claudio-wrapper` — a thin shell shim:
+   ```sh
+   #!/bin/sh
+   exec /abs/path/to/claudio wrapper --fallback-claude /abs/path/to/claude "$@"
+   ```
+2. Writes `claudeCode.claudeProcessWrapper` (pointing to that shim) and `claudeCode.disableLoginPrompt: true` to your user settings. Existing settings are preserved:
+   - VS Code on macOS: `~/Library/Application Support/Code/User/settings.json`
+   - VS Code on Windows: `%APPDATA%\Code\User\settings.json`
+   - Cursor: same paths under `Cursor` instead of `Code`
+
+When the IDE launches Claude Code, it runs the shim and passes **its own bundled `claude` binary as the first argument**. The shim resolves credentials non-interactively, injects them into the environment and execs that bundled binary — so you run the exact Claude Code build the extension ships, and secrets never appear in `ps` output. `--fallback-claude` is only used when the editor passes no binary (e.g. an unsupported platform) or when you run the shim manually.
+
+### Credentials profile resolution in wrapper mode
+
+In wrapper mode, claudio never prompts. Resolution order:
+
+1. `CLAUDIO_PROJECT` environment variable
+2. `--project` flag (if set in the environment that starts the IDE)
+3. Single profile auto-select (workspace `.claude/claudio.settings.local.json` with one profile)
+4. Fail with instructions if ambiguous
+
+If the profile cannot be resolved, the error message guides you to:
+- Set `CLAUDIO_PROJECT` in the shell that launches the IDE
+- Or create `.claude/claudio.settings.local.json` with one profile
+
+### Troubleshooting the VS Code / Cursor wrapper
+
+| Symptom | Cause / fix |
+| --- | --- |
+| Claude panel shows *Not logged in* / no authentication | Make sure `"claudeCode.disableLoginPrompt": true` is in your **user** settings — without it the extension shows a sign-in screen even though claudio injects valid credentials. `claudio setup vscode --workspace` sets this automatically. Then confirm the profile resolves (`claudio doctor`, plus `CLAUDIO_PROJECT` or a single-profile `.claude/claudio.settings.local.json`) and reload the window. |
+| Nothing happens / extension can't start | Confirm `~/.claude/claudio-wrapper` exists and is executable, and that `claudeCode.claudeProcessWrapper` in your **user** settings points at it. Re-run `claudio setup vscode --workspace`. |
+| Works in terminal but not in the panel | The IDE may not inherit your shell env. Launch it with `code .` from a terminal, or pin the profile via `.claude/claudio.settings.local.json`. |
+
+## Troubleshooting with `claudio doctor`
+
+`claudio doctor` performs a health check on your configuration and exits 1 if any warnings are found.
+
+```
+$ claudio doctor
+
+Binaries:
+  claude   /usr/local/bin/claude
+  op       /usr/local/bin/op
+
+Config:
+  .claude/claudio.settings.local.json  [active]
+  .claude/claudio.settings.json        [not found]
+  ~/.claude/claudio.settings.json      [not found]
+
+1 project(s) configured.
+
+  Klant A
+    ANTHROPIC_BASE_URL    (plaintext)
+    ANTHROPIC_AUTH_TOKEN  (1Password)
+
+No issues found.
+```
+
+Output is always redacted: only variable names and their storage type (`1Password`, `Keychain` or `plaintext`) are shown — resolved secret values are never printed.
 
