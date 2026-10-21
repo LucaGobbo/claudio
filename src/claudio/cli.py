@@ -2,22 +2,285 @@
 
 from __future__ import annotations
 
-import argparse
-import json
 import os
-import subprocess
+import shutil
 import sys
 
-from claudio.projects import select_project
-from claudio.settings import (
+from claudio.setup import CURSOR, VSCODE, cmd_setup_print, cmd_setup_workspace
+from claudio.config import (
     ConfigError,
-    merged_claudio_config,
+    claudio_config_candidates,
+    claudio_config_layers,
     highest_claude_env,
+    load_user_settings,
+    merged_claudio_config,
     validate_projects,
 )
+from claudio.launcher import exec_claude
+from claudio.runtime import build_effective_env
+from claudio.secrets import resolve_op_references
+from claudio.selector import AmbiguousProject, ProjectNotFound, resolve_project
+
+
+def _print_ambiguous_error(exc: AmbiguousProject) -> None:
+    print(
+        "claudio: Multiple Claudio projects found and interactive selection is disabled.\n",
+        file=sys.stderr,
+    )
+    print("Choose one of:", file=sys.stderr)
+    for p in exc.projects:
+        name = p["name"]
+        print(f'  claudio --project "{name}" ...', file=sys.stderr)
+    print(f'  export CLAUDIO_PROJECT="{exc.projects[0]["name"]}"', file=sys.stderr)
+    print(
+        "  create .claude/claudio.settings.local.json with one project",
+        file=sys.stderr,
+    )
+
+
+def _print_not_found_error(exc: ProjectNotFound) -> None:
+    print(f"claudio: project not found: {exc.name!r}", file=sys.stderr)
+    print("Available projects:", file=sys.stderr)
+    for p in exc.available:
+        print(f"  {p['name']}", file=sys.stderr)
+
+
+def _apply_project_env(project: dict) -> None:
+    """Resolve and inject project env vars into the current process environment."""
+    project_env = project.get("env", {})
+    if not project_env:
+        return
+    _, base_env = highest_claude_env()
+    effective_env = build_effective_env(base_env, project_env)
+    effective_env = resolve_op_references(effective_env)
+    os.environ.update(effective_env)
+
+
+def _cmd_projects(projects: list[dict]) -> None:
+    settings = load_user_settings()
+    last = settings.get("lastProject")
+    for p in projects:
+        marker = "*" if p["name"] == last else " "
+        print(f"  {marker} {p['name']}")
+
+
+_CREDENTIAL_VARS = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+_PROXY_VAR = "ANTHROPIC_BASE_URL"
+_KNOWN_VARS = (_PROXY_VAR,) + _CREDENTIAL_VARS
+_VAR_WIDTH = max(len(v) for v in _KNOWN_VARS)  # 20
+
+
+def _cmd_doctor(projects: list[dict], hint: str | None = None) -> None:
+    """Check project config health. Exits 1 if any warnings are found."""
+    warnings = 0
+
+    # -- Binaries -----------------------------------------------------------
+    print("Binaries:")
+    for bin_name in ("claude", "op"):
+        path = shutil.which(bin_name)
+        if path:
+            print(f"  {bin_name:<8}  {path}")
+        else:
+            print(f"  {bin_name:<8}  not found")
+            if bin_name == "op":
+                print(
+                    "             install from "
+                    "https://developer.1password.com/docs/cli/get-started/"
+                )
+            warnings += 1
+    print()
+
+    # -- Config layers ------------------------------------------------------
+    print("Config:")
+    active_paths = {str(path) for _label, path, _data in claudio_config_layers()}
+    for _label, path in claudio_config_candidates():
+        if path.exists():
+            tag = "active" if str(path) in active_paths else "exists (no projects key)"
+        else:
+            tag = "not found"
+        print(f"  {path}  [{tag}]")
+    print()
+
+    # -- Projects -----------------------------------------------------------
+    # Filter to a single project when a hint is given.
+    display_projects = projects
+    if hint:
+        display_projects = [p for p in projects if p["name"] == hint]
+        if not display_projects:
+            print(f"claudio doctor: project not found: {hint!r}", file=sys.stderr)
+            sys.exit(1)
+
+    print(f"{len(display_projects)} project(s) configured.\n")
+
+    for proj in display_projects:
+        name = proj["name"]
+        env = proj.get("env", {})
+        print(f"  {name}")
+
+        for var in _KNOWN_VARS:
+            if var in env:
+                val = env[var]
+                src = "1Password" if val.startswith("op://") else "plaintext"
+                print(f"    {var:<{_VAR_WIDTH}}  ({src})")
+
+        other_vars = sorted(k for k in env if k not in set(_KNOWN_VARS))
+        for var in other_vars:
+            print(f"    {var}")
+
+        has_api_key = "ANTHROPIC_API_KEY" in env
+        has_auth_token = "ANTHROPIC_AUTH_TOKEN" in env
+
+        if not has_api_key and not has_auth_token:
+            print("    warning: no credential configured — set ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY")
+            warnings += 1
+        elif has_api_key and has_auth_token:
+            print(
+                "    warning: both ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN are set"
+                " — ANTHROPIC_AUTH_TOKEN takes precedence; remove one"
+            )
+            warnings += 1
+
+        if has_auth_token and _PROXY_VAR not in env:
+            print("    note: ANTHROPIC_AUTH_TOKEN set without ANTHROPIC_BASE_URL — is a proxy URL intended?")
+
+        print()
+
+    if warnings:
+        print(f"{warnings} warning(s).")
+        sys.exit(1)
+    print("No issues found.")
+
+
+def _cmd_setup(remainder: list[str]) -> None:
+    """Dispatch claudio setup <editor> [--print | --workspace]."""
+    _EDITORS = {"vscode": VSCODE, "cursor": CURSOR}
+
+    if not remainder or remainder[0] not in _EDITORS:
+        print(
+            "Usage: claudio setup <editor> [--print | --workspace]\n"
+            f"Editors: {', '.join(_EDITORS)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    editor_name = remainder[0]
+    flags = remainder[1:]
+    adapter = _EDITORS[editor_name]
+
+    if "--workspace" in flags:
+        cmd_setup_workspace(adapter)
+    else:
+        # Default to --print if no flag is given.
+        cmd_setup_print(adapter)
+
+
+def _looks_like_executable(path: str) -> bool:
+    """True if *path* points at an existing executable file."""
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def _resolve_wrapper_claude(
+    remainder: list[str], fallback_claude: str | None
+) -> tuple[str | None, list[str]]:
+    """Determine which claude binary to exec and the args to pass to it.
+
+    VS Code / Cursor invoke the process wrapper with their bundled claude
+    binary as the first argument. Prefer that binary; otherwise use the
+    shim's --fallback-claude; otherwise treat the first arg as the binary
+    (backwards-compatible manual `claudio wrapper -- /path/to/claude` use).
+    """
+    if remainder and _looks_like_executable(remainder[0]):
+        claude_path, *claude_args = remainder
+        return claude_path, claude_args
+    if fallback_claude:
+        return fallback_claude, remainder
+    if remainder:
+        claude_path, *claude_args = remainder
+        return claude_path, claude_args
+    return None, []
+
+
+def _cmd_wrapper(projects: list[dict], hint: str | None, remainder: list[str]) -> None:
+    """Non-interactive project resolver for VS Code / Cursor process wrapper use."""
+    # Extract the optional --fallback-claude PATH emitted by the generated shim.
+    fallback_claude: str | None = None
+    rest: list[str] = []
+    i = 0
+    while i < len(remainder):
+        arg = remainder[i]
+        if arg == "--fallback-claude" and i + 1 < len(remainder):
+            fallback_claude = remainder[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--fallback-claude="):
+            fallback_claude = arg.split("=", 1)[1]
+            i += 1
+            continue
+        rest.append(arg)
+        i += 1
+    remainder = rest
+
+    if remainder and remainder[0] == "--":
+        remainder = remainder[1:]
+
+    claude_path, claude_args = _resolve_wrapper_claude(remainder, fallback_claude)
+
+    if not claude_path:
+        print(
+            "claudio wrapper: missing claude path\n"
+            "  Usage: claudio wrapper -- /path/to/claude [...args]\n"
+            "  Tip:   use 'which claude' to find the path",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        selected = resolve_project(projects, hint=hint, interactive=False)
+    except AmbiguousProject as exc:
+        print(
+            "claudio wrapper: cannot resolve project non-interactively.\n"
+            "\n"
+            "Fix options:\n"
+            "  1. Set CLAUDIO_PROJECT in the shell that starts your IDE:\n"
+            f'       export CLAUDIO_PROJECT="{exc.projects[0]["name"]}"\n'
+            "  2. Create .claude/claudio.settings.local.json with one project.\n"
+            "  3. Run `claudio setup vscode --workspace` to pin the project.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except ProjectNotFound as exc:
+        _print_not_found_error(exc)
+        sys.exit(1)
+
+    if selected is None:
+        sys.exit(1)
+
+    _apply_project_env(selected)
+    exec_claude(claude_args, claude_path=claude_path)
+
+
+def _cmd_current(projects: list[dict], hint: str | None) -> None:
+    try:
+        selected = resolve_project(projects, hint=hint, interactive=False)
+    except AmbiguousProject as exc:
+        settings = load_user_settings()
+        last = settings.get("lastProject")
+        if last:
+            for p in exc.projects:
+                if p["name"] == last:
+                    print(p["name"])
+                    return
+        _print_ambiguous_error(exc)
+        sys.exit(1)
+    except ProjectNotFound as exc:
+        _print_not_found_error(exc)
+        sys.exit(1)
+    if selected is not None:
+        print(selected["name"])
 
 
 def main() -> None:
+    import argparse
     from importlib.metadata import version
 
     parser = argparse.ArgumentParser(
@@ -31,14 +294,39 @@ def main() -> None:
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {version('claudio')}"
     )
-    # We capture only our own flags; everything else goes to claude.
+    parser.add_argument(
+        "--project",
+        "-p",
+        metavar="NAME",
+        help="Select a project by name (skips interactive prompt)",
+    )
+    parser.add_argument(
+        "--no-interactive",
+        action="store_true",
+        help="Fail if interactive selection would be required",
+    )
+
     args, claude_args = parser.parse_known_args()
+
+    command: str | None = None
+    if claude_args and claude_args[0] in ("projects", "current", "doctor", "wrapper", "setup"):
+        command = claude_args.pop(0)
+
+    if command == "setup":
+        _cmd_setup(claude_args)
+        return
+
+    hint: str | None = args.project or os.environ.get("CLAUDIO_PROJECT") or None
+    interactive = not args.no_interactive
 
     config = merged_claudio_config()
 
     if not config:
-        # No claudio config at all — just launch claude directly.
-        _exec_claude(claude_args)
+        if command in ("projects", "current", "doctor", "wrapper"):
+            print("claudio: no projects configured", file=sys.stderr)
+            sys.exit(1)
+        exec_claude(claude_args)
+        return
 
     try:
         projects = validate_projects(config)
@@ -46,50 +334,34 @@ def main() -> None:
         print(f"claudio: config error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    if len(projects) == 1:
-        selected = projects[0]
-    else:
-        selected = select_project(projects)
-        if selected is None:
-            sys.exit(130)
+    if command == "projects":
+        _cmd_projects(projects)
+        return
 
-    project_env = selected.get("env", {})
-    extra_settings_args: list[str] = []
-    if project_env:
-        _, base_env = highest_claude_env()
-        merged = {**base_env, **project_env}
-        merged = _resolve_op_references(merged)
-        extra_settings_args = ["--settings", json.dumps({"env": merged})]
+    if command == "current":
+        _cmd_current(projects, hint)
+        return
 
+    if command == "doctor":
+        _cmd_doctor(projects, hint=hint)
+        return
+
+    if command == "wrapper":
+        _cmd_wrapper(projects, hint, claude_args)
+        return
+
+    try:
+        selected = resolve_project(projects, hint=hint, interactive=interactive)
+    except ProjectNotFound as exc:
+        _print_not_found_error(exc)
+        sys.exit(1)
+    except AmbiguousProject as exc:
+        _print_ambiguous_error(exc)
+        sys.exit(1)
+
+    if selected is None:
+        sys.exit(130)
+
+    _apply_project_env(selected)
     print(f"Using project: {selected['name']}")
-    _exec_claude(extra_settings_args + claude_args)
-
-
-def _resolve_op_references(env: dict[str, str]) -> dict[str, str]:
-    resolved = {}
-    for key, value in env.items():
-        if value.startswith("op://"):
-            result = subprocess.run(
-                ["op", "read", value],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                print(
-                    f"claudio: failed to read 1Password secret for {key}: {result.stderr.strip()}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-            resolved[key] = result.stdout.strip()
-        else:
-            resolved[key] = value
-    return resolved
-
-
-def _exec_claude(claude_args: list[str]) -> None:
-    """Replace the current process with `claude`."""
-    if sys.platform == "win32":
-        result = subprocess.run(["claude", *claude_args], shell=True)
-        sys.exit(result.returncode)
-    else:
-        os.execvp("claude", ["claude", *claude_args])
+    exec_claude(claude_args)
